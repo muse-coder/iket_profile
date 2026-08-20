@@ -87,8 +87,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     # Instrumented code must be compiled in this process, not loaded from a
-    # pre-instrumentation CuTe DSL cache entry.
+    # pre-instrumentation CuTe DSL cache entry. Quack has an additional object
+    # cache which otherwise bypasses the CuTe compilation path and all hooks.
     os.environ["CUTE_DSL_NO_CACHE"] = "1"
+    os.environ["QUACK_CACHE_ENABLED"] = "0"
     with patch_cute_iket_ops(detailed_cta=args.detailed_cta):
         run_python_target(args.command)
     return 0

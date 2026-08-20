@@ -116,7 +116,32 @@ iket-cutedsl profile --postprocess json -o ./iket_output -- \
 ```
 
 `.trace.json` 用于脚本统计和模式分析，不是 Perfetto JSON，不能直接拖入
-Perfetto UI。也可以使用 `--postprocess html` 或 `--postprocess all`。
+Perfetto UI。选择 `json` 或 `all` 时，工具还会生成
+`*.trace.semantic.json`，把压缩 payload 解码为 tile、stage 和循环序号。也可以
+单独解码已有 trace：
+
+```bash
+iket-cutedsl decode iket_pid_123.trace.json
+```
+
+## Tile 和 stage
+
+工具在三层自动补充语义，不要求修改 kernel：
+
+- scheduler 层：`auto.scheduler.tile` 记录 scheduler 返回的前四个真实坐标轴；
+- pipeline 层：pipeline wait/commit/release 记录 `stage`、`phase` 和单调的
+  `sequence`，同一 warp 上相邻的 MMA/TMA range 可按时间关联；
+- loop 层：每次动态 `cutlass.range` 迭代生成 `auto.loop.tile_seq`，记录源码行号和
+  实际 induction value。
+
+FlashAttention、Quack 等自定义 scheduler 会在模块加载时按 scheduler 方法协议
+自动发现。带 `break`、`continue` 或 `return` 的循环不会自动包 range，以保证
+start/end 成对；这种循环仍可从 scheduler 或 pipeline 事件分析。
+
+`scheduler.tile` 是逻辑 tile 坐标；语义 JSON 使用 `tile_0..tile_3`，各轴含义由
+scheduler 定义（标准 GEMM 通常对应 `m,n,l`，第四轴为 0）。`loop.tile_seq` 是
+循环迭代证据，并不保证每个循环都恰好对应一个输出 tile。坐标 payload 当前
+保存四个非负、各 16-bit 的轴。这些细节只在 `--detailed-cta` 选择的 CTA 中记录。
 
 ## Python API
 
@@ -140,6 +165,9 @@ kernel 的导入和编译应位于 context 内。普通场景优先使用 CLI。
 - `cp.async`、TMEM、scheduler 和 barrier；
 - 通过 CuTe DSL `llvm.inline_asm` 发出的 MMA、TMA、mbarrier 和 async wait；
 - FlashInfer GDN/MoE 和 FlashAttention/Quack 使用的典型路径。
+
+为保证 hooks 参与实际 JIT，CLI 会禁用 CuTe DSL 编译缓存以及 Quack object
+cache。本工具不会改写第三方仓库中的 kernel 源码。
 
 ## 数据边界
 

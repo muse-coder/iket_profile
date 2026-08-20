@@ -45,6 +45,32 @@ CuTe DSL launcher without editing its kernel source.
    `iket_pid_*.pftrace` or `iket_pid_*.trace.json`.
 9. Inspect event coverage before drawing conclusions. Confirm warp lifetimes
    and expected MMA/TMA/wait families are present.
+10. With `json` or `all`, inspect the automatically written
+    `*.trace.semantic.json`. Decode an existing JSON trace with:
+
+    ```bash
+    iket-cutedsl decode /path/to/iket_pid_123.trace.json
+    ```
+
+## Automatic tile and pipeline semantics
+
+Interpret the semantic sidecar in this order:
+
+- `auto.scheduler.tile` contains the scheduler's first four logical coordinate
+  axes as `tile_0..tile_3`. Standard CUTLASS schedulers and third-party classes exposing
+  `get_current_work`, `initial_work_tile_info`, or `advance_to_next_work` are
+  discovered automatically.
+- Pipeline wait/commit/release ranges decode to `sequence`, `stage`, and
+  `phase`. Correlate adjacent MMA/TMA ranges on the same warp by time; payload
+  SSA values are deliberately not carried across control-flow regions.
+- `auto.loop.tile_seq` records the source line and dynamic induction value for
+  each balanced `cutlass.range` iteration. It is iteration evidence, not an
+  unconditional claim that the loop is one output tile.
+
+Loops containing `break`, `continue`, or `return` are skipped so range endpoints
+remain balanced. Scheduler coordinates remain the stronger tile identity when
+both forms are present. Axis meanings are scheduler-defined; standard GEMM is
+normally `(m,n,l,0)`. Payloads retain four non-negative 16-bit axes.
 
 ## CTA selection
 
@@ -100,7 +126,7 @@ with patch_cute_iket_ops(detailed_cta=(0, 0, 0)):
 
 Ensure compilation happens inside the context. Prefer the CLI for ordinary
 profiling because it installs hooks before importing the target and sets
-`CUTE_DSL_NO_CACHE=1`.
+`CUTE_DSL_NO_CACHE=1` and `QUACK_CACHE_ENABLED=0`.
 
 ## Interpretation guardrails
 

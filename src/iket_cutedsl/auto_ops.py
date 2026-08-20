@@ -7,18 +7,25 @@ This module instruments major prologue, mainloop, scheduler, epilogue, and
 selected inline-PTX operations without tracing individual SASS instructions.
 """
 
+import ast
+import builtins
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import wraps
 import re
+import sys
 import threading
 from types import ModuleType
 from typing import Any, Callable, Iterator, List, Optional, Tuple, Union
 
+import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
+from cutlass.base_dsl import ast_helpers
+from cutlass.base_dsl.ast_preprocessor import DSLPreprocessor, _create_module_attribute
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.atom import CopyAtom, MmaAtom
 from cutlass.cute.nvgpu import cpasync
@@ -44,9 +51,10 @@ _SMEM_STORE_OPS = (CopyR2SOp, StMatrix8x8x16bOp, StMatrix16x8x8bOp)
 
 _patch_lock = threading.RLock()
 _patch_depth = 0
-_saved_targets: Optional[List[Tuple[Any, str, Callable[..., Any]]]] = None
+_saved_targets: Optional[List[Tuple[Any, str, Any]]] = None
 _active_detailed_cta: Optional[Tuple[int, int, int]] = None
 _trace_state = threading.local()
+_MISSING = object()
 
 _PTX_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _PTX_LINE_COMMENT_RE = re.compile(r"//.*?$", re.MULTILINE)
@@ -88,8 +96,33 @@ _INLINE_PTX_WAIT_PATTERNS = (
     ),
 )
 
-EventSelector = Union[str, Callable[..., Optional[str]]]
+@dataclass(frozen=True)
+class _EventSpec:
+    name: str
+    payload: Any = None
+
+
+EventSelection = Optional[Union[str, _EventSpec]]
+EventSelector = Union[str, Callable[..., EventSelection]]
 DetailedCta = Optional[Tuple[int, int, int]]
+
+_PIPELINE_STAGE_BITS = 8
+_PIPELINE_PHASE_SHIFT = _PIPELINE_STAGE_BITS
+_PIPELINE_COUNT_SHIFT = _PIPELINE_PHASE_SHIFT + 1
+_TILE_COORD_BITS = 16
+_TILE_COORD_MASK = (1 << _TILE_COORD_BITS) - 1
+_LOOP_SITE_BITS = 16
+_LOOP_INDEX_BITS = 64 - _LOOP_SITE_BITS
+_LOOP_INDEX_MASK = (1 << _LOOP_INDEX_BITS) - 1
+_LOOP_EVENT_NAME = "auto.loop.tile_seq"
+_SCHEDULER_TILE_EVENT_NAME = "auto.scheduler.tile"
+_LOOP_START_HELPER = "_iket_auto_loop_range_start"
+_LOOP_END_HELPER = "_iket_auto_loop_range_end"
+_SCHEDULER_METHOD_NAMES = (
+    "get_current_work",
+    "initial_work_tile_info",
+    "advance_to_next_work",
+)
 
 
 def _normalize_detailed_cta(detailed_cta: Any) -> DetailedCta:
@@ -102,11 +135,78 @@ def _normalize_detailed_cta(detailed_cta: Any) -> DetailedCta:
     return detailed_cta
 
 
+def _as_event_spec(selection: EventSelection) -> Optional[_EventSpec]:
+    if selection is None:
+        return None
+    if isinstance(selection, _EventSpec):
+        return selection
+    return _EventSpec(selection)
+
+
+@dsl_user_op
+@cute.jit
+def _pack_pipeline_state(
+    state: pipeline.PipelineState,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> cutlass.Int64:
+    """Pack ``count/index/phase`` into one IKET payload.
+
+    Layout: ``count << 9 | phase << 8 | stage``.  The stage field is eight
+    bits, which is comfortably above the number of stages supported by CuTe
+    pipelines.  ``count`` is the exact pipeline progression counter and is a
+    useful regular-loop tile sequence when no scheduler coordinate exists.
+    """
+    return (
+        (cutlass.Int64(state.count) << _PIPELINE_COUNT_SHIFT)
+        | (cutlass.Int64(state.phase) << _PIPELINE_PHASE_SHIFT)
+        | cutlass.Int64(state.index)
+    )
+
+
+@dsl_user_op
+@cute.jit
+def _pack_tile_coord(
+    m: Any,
+    n: Any,
+    batch: Any,
+    extra: Any,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> cutlass.Int64:
+    """Pack four non-negative scheduler coordinate axes into 64 bits."""
+    return (
+        ((cutlass.Int64(m) & _TILE_COORD_MASK) << (3 * _TILE_COORD_BITS))
+        | ((cutlass.Int64(n) & _TILE_COORD_MASK) << (2 * _TILE_COORD_BITS))
+        | ((cutlass.Int64(batch) & _TILE_COORD_MASK) << _TILE_COORD_BITS)
+        | (cutlass.Int64(extra) & _TILE_COORD_MASK)
+    )
+
+
+@dsl_user_op
+@cute.jit
+def _pack_loop_iteration(
+    source_line: int,
+    induction: Any,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> cutlass.Int64:
+    """Pack a 16-bit source line and 48-bit dynamic induction value."""
+    return (
+        (cutlass.Int64(source_line & ((1 << _LOOP_SITE_BITS) - 1)) << _LOOP_INDEX_BITS)
+        | (cutlass.Int64(induction) & _LOOP_INDEX_MASK)
+    )
+
+
 @dsl_user_op
 @cute.jit
 def _range_start_for_cta(
     event_name: str,
     detailed_cta: Tuple[int, int, int],
+    payload: Any = None,
     *,
     loc: Optional[ir.Location] = None,
     ip: Optional[ir.InsertionPoint] = None,
@@ -118,8 +218,14 @@ def _range_start_for_cta(
         & (block_y == detailed_cta[1])
         & (block_z == detailed_cta[2])
     )
+    if cutlass.const_expr(payload is None):
+        return (
+            cute.experimental.iket.range_start(event_name, loc=loc, ip=ip)
+            if is_target
+            else cute.experimental.iket.sentinel_token(event_name, loc=loc, ip=ip)
+        )
     return (
-        cute.experimental.iket.range_start(event_name, loc=loc, ip=ip)
+        cute.experimental.iket.range_start(event_name, payload, loc=loc, ip=ip)
         if is_target
         else cute.experimental.iket.sentinel_token(event_name, loc=loc, ip=ip)
     )
@@ -128,13 +234,85 @@ def _range_start_for_cta(
 def _range_start(
     event_name: str,
     detailed_cta: DetailedCta,
+    payload: Any = None,
     *,
     loc: Optional[ir.Location] = None,
     ip: Optional[ir.InsertionPoint] = None,
 ) -> Any:
     if detailed_cta is None:
-        return cute.experimental.iket.range_start(event_name, loc=loc, ip=ip)
-    return _range_start_for_cta(event_name, detailed_cta, loc=loc, ip=ip)
+        if payload is None:
+            return cute.experimental.iket.range_start(event_name, loc=loc, ip=ip)
+        return cute.experimental.iket.range_start(event_name, payload, loc=loc, ip=ip)
+    return _range_start_for_cta(
+        event_name, detailed_cta, payload, loc=loc, ip=ip
+    )
+
+
+def _range_end(
+    token: Any,
+    payload: Any = None,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    if payload is None:
+        cute.experimental.iket.range_end(token, loc=loc, ip=ip)
+    else:
+        cute.experimental.iket.range_end(token, payload, loc=loc, ip=ip)
+
+
+@dsl_user_op
+@cute.jit
+def _mark_for_cta(
+    event_name: str,
+    payload: Any,
+    detailed_cta: Tuple[int, int, int],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    block_x, block_y, block_z = cute.arch.block_idx()
+    is_target = (
+        (block_x == detailed_cta[0])
+        & (block_y == detailed_cta[1])
+        & (block_z == detailed_cta[2])
+    )
+    if is_target:
+        cute.experimental.iket.mark(event_name, payload, loc=loc, ip=ip)
+
+
+def _mark(
+    event_name: str,
+    payload: Any,
+    detailed_cta: DetailedCta,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    if detailed_cta is None:
+        cute.experimental.iket.mark(event_name, payload, loc=loc, ip=ip)
+    else:
+        _mark_for_cta(event_name, payload, detailed_cta, loc=loc, ip=ip)
+
+
+@dsl_user_op
+@cute.jit
+def _mark_valid_scheduler_tile(
+    payload: Any,
+    is_valid: Any,
+    detailed_cta: DetailedCta,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    if is_valid:
+        _mark(
+            _SCHEDULER_TILE_EVENT_NAME,
+            payload,
+            detailed_cta,
+            loc=loc,
+            ip=ip,
+        )
 
 
 def _copy_event_name(op: Any) -> Optional[str]:
@@ -300,7 +478,7 @@ def _make_traced_inline_asm(
                     ip=ip,
                 )
             finally:
-                cute.experimental.iket.range_end(token, loc=loc, ip=ip)
+                _range_end(token, loc=loc, ip=ip)
         finally:
             _trace_state.suppress_inline_hook = previous_suppression
 
@@ -315,37 +493,87 @@ def _participant_origin(participant: Any) -> Any:
     return participant.get_origin()
 
 
-def _producer_acquire_event(producer: pipeline.PipelineProducer, *_: Any) -> str:
+def _pipeline_state(subject: Any, args: Tuple[Any, ...] = ()) -> Any:
+    """Return the dynamic PipelineState carried by a participant or call."""
+    if isinstance(subject, pipeline.PipelineState):
+        return subject
+    if isinstance(subject, pipeline.PipelineProducer):
+        return subject._PipelineProducer__state
+    if isinstance(subject, pipeline.PipelineConsumer):
+        return subject._PipelineConsumer__state
+
+    immutable_state = getattr(
+        subject, "_ImmutableResourceHandle__immutable_state", None
+    )
+    if immutable_state is not None:
+        return immutable_state
+
+    for value in args:
+        if isinstance(value, pipeline.PipelineState):
+            return value
+    return None
+
+
+def _pipeline_spec(
+    event_name: str,
+    subject: Any,
+    args: Tuple[Any, ...] = (),
+) -> _EventSpec:
+    state = _pipeline_state(subject, args)
+    payload = _pack_pipeline_state(state) if state is not None else None
+    return _EventSpec(event_name, payload)
+
+
+def _fixed_pipeline_event(
+    event_name: str,
+) -> Callable[..., _EventSpec]:
+    def select(subject: Any, *args: Any, **_: Any) -> _EventSpec:
+        return _pipeline_spec(event_name, subject, args)
+
+    return select
+
+
+def _producer_acquire_event(
+    producer: pipeline.PipelineProducer, *args: Any
+) -> _EventSpec:
     origin = _participant_origin(producer)
     if isinstance(origin, pipeline.PipelineTmaUmma):
-        return "auto.main.tma.buffer_wait"
-    if isinstance(origin, pipeline.PipelineUmmaAsync):
-        return "auto.main.acc.buffer_wait"
-    return "auto.main.pipeline.buffer_wait"
+        name = "auto.main.tma.buffer_wait"
+    elif isinstance(origin, pipeline.PipelineUmmaAsync):
+        name = "auto.main.acc.buffer_wait"
+    else:
+        name = "auto.main.pipeline.buffer_wait"
+    return _pipeline_spec(name, producer, args)
 
 
-def _consumer_wait_event(consumer: pipeline.PipelineConsumer, *_: Any) -> str:
+def _consumer_wait_event(
+    consumer: pipeline.PipelineConsumer, *args: Any
+) -> _EventSpec:
     origin = _participant_origin(consumer)
     if isinstance(origin, pipeline.PipelineTmaUmma):
-        return "auto.main.tma.data_wait"
-    if isinstance(origin, pipeline.PipelineUmmaAsync):
-        return "auto.epilogue.acc.wait"
-    return "auto.main.pipeline.data_wait"
+        name = "auto.main.tma.data_wait"
+    elif isinstance(origin, pipeline.PipelineUmmaAsync):
+        name = "auto.epilogue.acc.wait"
+    else:
+        name = "auto.main.pipeline.data_wait"
+    return _pipeline_spec(name, consumer, args)
 
 
-def _producer_commit_event(handle: Any, *_: Any) -> Optional[str]:
+def _producer_commit_event(handle: Any, *args: Any) -> Optional[_EventSpec]:
     if isinstance(_participant_origin(handle), pipeline.PipelineUmmaAsync):
-        return "auto.main.acc.commit"
+        return _pipeline_spec("auto.main.acc.commit", handle, args)
     return None
 
 
-def _consumer_release_event(handle: Any, *_: Any) -> Optional[str]:
+def _consumer_release_event(handle: Any, *args: Any) -> Optional[_EventSpec]:
     origin = _participant_origin(handle)
     if isinstance(origin, pipeline.PipelineTmaUmma):
-        return "auto.main.tma.release"
-    if isinstance(origin, pipeline.PipelineUmmaAsync):
-        return "auto.epilogue.acc.release"
-    return None
+        name = "auto.main.tma.release"
+    elif isinstance(origin, pipeline.PipelineUmmaAsync):
+        name = "auto.epilogue.acc.release"
+    else:
+        return None
+    return _pipeline_spec(name, handle, args)
 
 
 def _named_barrier_event(barrier: pipeline.NamedBarrier, *_: Any) -> Optional[str]:
@@ -368,19 +596,22 @@ def _make_traced_call(
         ip: Optional[ir.InsertionPoint] = None,
         **kwargs: Any,
     ) -> Any:
-        event_name = (
+        selection = (
             event_selector(*args, **kwargs)
             if callable(event_selector)
             else event_selector
         )
-        if event_name is None:
+        event = _as_event_spec(selection)
+        if event is None:
             return original(*args, loc=loc, ip=ip, **kwargs)
 
-        token = _range_start(event_name, detailed_cta, loc=loc, ip=ip)
+        token = _range_start(
+            event.name, detailed_cta, event.payload, loc=loc, ip=ip
+        )
         try:
             return original(*args, loc=loc, ip=ip, **kwargs)
         finally:
-            cute.experimental.iket.range_end(token, loc=loc, ip=ip)
+            _range_end(token, event.payload, loc=loc, ip=ip)
 
     return traced_call
 
@@ -429,7 +660,7 @@ def _make_traced_copy(
             )
         finally:
             _trace_state.suppress_inline_hook = previous_suppression
-            cute.experimental.iket.range_end(token, loc=loc, ip=ip)
+            _range_end(token, loc=loc, ip=ip)
 
     return traced_copy
 
@@ -449,7 +680,8 @@ def _make_traced_gemm(
         ip: Optional[ir.InsertionPoint] = None,
         **kwargs: Any,
     ) -> Any:
-        token = _range_start(_mma_event_name(atom.op), detailed_cta, loc=loc, ip=ip)
+        event_name = _mma_event_name(atom.op)
+        token = _range_start(event_name, detailed_cta, loc=loc, ip=ip)
         previous_suppression = getattr(_trace_state, "suppress_inline_hook", False)
         _trace_state.suppress_inline_hook = True
         try:
@@ -465,13 +697,232 @@ def _make_traced_gemm(
             )
         finally:
             _trace_state.suppress_inline_hook = previous_suppression
-            cute.experimental.iket.range_end(token, loc=loc, ip=ip)
+            _range_end(token, loc=loc, ip=ip)
 
     return traced_gemm
 
 
+def _flatten_coord(value: Any) -> Tuple[Any, ...]:
+    if isinstance(value, (tuple, list)):
+        return tuple(component for item in value for component in _flatten_coord(item))
+    return (0 if value is None else value,)
+
+
+def _tile_coord_components(
+    work_tile: Any,
+) -> Optional[Tuple[Any, Any, Any, Any]]:
+    try:
+        tile_idx = work_tile.tile_idx
+        values = _flatten_coord(tile_idx)
+    except (AttributeError, TypeError):
+        return None
+    if not values:
+        return None
+    padded = (*values[:4], 0, 0, 0, 0)
+    return padded[0], padded[1], padded[2], padded[3]
+
+
+def _make_traced_scheduler_work(
+    original: Callable[..., Any], detailed_cta: DetailedCta
+) -> Callable[..., Any]:
+    @dsl_user_op
+    @wraps(original)
+    def traced_scheduler_work(
+        *args: Any,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+        **kwargs: Any,
+    ) -> Any:
+        if getattr(_trace_state, "suppress_scheduler_hook", False):
+            return original(*args, loc=loc, ip=ip, **kwargs)
+
+        previous = getattr(_trace_state, "suppress_scheduler_hook", False)
+        _trace_state.suppress_scheduler_hook = True
+        try:
+            work_tile = original(*args, loc=loc, ip=ip, **kwargs)
+        finally:
+            _trace_state.suppress_scheduler_hook = previous
+
+        components = _tile_coord_components(work_tile)
+        if components is not None:
+            payload = _pack_tile_coord(*components, loc=loc, ip=ip)
+            _mark_valid_scheduler_tile(
+                payload,
+                work_tile.is_valid_tile,
+                detailed_cta,
+                loc=loc,
+                ip=ip,
+            )
+        return work_tile
+
+    return traced_scheduler_work
+
+
+def _is_scheduler_class(value: Any, module_name: str) -> bool:
+    return (
+        isinstance(value, type)
+        and value.__module__ == module_name
+        and value.__name__.endswith("Scheduler")
+        and any(name in value.__dict__ for name in _SCHEDULER_METHOD_NAMES)
+    )
+
+
+def _patch_scheduler_classes_in_module(
+    module: ModuleType, detailed_cta: DetailedCta
+) -> None:
+    """Patch scheduler protocol implementations defined by a newly loaded module."""
+    assert _saved_targets is not None
+    patched = {(id(owner), name) for owner, name, _ in _saved_targets}
+    for attribute_name, value in vars(module).items():
+        if not attribute_name.endswith("Scheduler"):
+            continue
+        if not _is_scheduler_class(value, module.__name__):
+            continue
+        for method_name in _SCHEDULER_METHOD_NAMES:
+            original = value.__dict__.get(method_name)
+            if original is None or (id(value), method_name) in patched:
+                continue
+            _set_patch(
+                _saved_targets,
+                value,
+                method_name,
+                _make_traced_scheduler_work(original, detailed_cta),
+            )
+            patched.add((id(value), method_name))
+
+
+def _make_scheduler_aware_import(
+    original_import: Callable[..., Any], detailed_cta: DetailedCta
+) -> Callable[..., Any]:
+    """Discover third-party scheduler classes after their module is imported."""
+    @wraps(original_import)
+    def traced_import(*args: Any, **kwargs: Any) -> Any:
+        result = original_import(*args, **kwargs)
+        candidates = set()
+        if isinstance(result, ModuleType):
+            candidates.add(result)
+        if args and isinstance(args[0], str):
+            candidates.add(sys.modules.get(args[0]))
+        fromlist = args[3] if len(args) > 3 else kwargs.get("fromlist", ())
+        if isinstance(result, ModuleType) and fromlist:
+            for item in fromlist:
+                if isinstance(item, str):
+                    candidates.add(sys.modules.get(f"{result.__name__}.{item}"))
+        for module in candidates:
+            if isinstance(module, ModuleType):
+                _patch_scheduler_classes_in_module(module, detailed_cta)
+        return result
+
+    return traced_import
+
+
+@dsl_user_op
+def _loop_range_start(
+    source_line: int,
+    induction: Any,
+    detailed_cta: DetailedCta,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Any:
+    payload = _pack_loop_iteration(source_line, induction, loc=loc, ip=ip)
+    return _range_start(
+        _LOOP_EVENT_NAME, detailed_cta, payload, loc=loc, ip=ip
+    )
+
+
+@dsl_user_op
+def _loop_range_end(
+    token: Any,
+    source_line: int,
+    induction: Any,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    payload = _pack_loop_iteration(source_line, induction, loc=loc, ip=ip)
+    _range_end(token, payload, loc=loc, ip=ip)
+
+
+def _should_instrument_loop(preprocessor: DSLPreprocessor, node: ast.For) -> bool:
+    if not isinstance(node.target, ast.Name) or not node.body:
+        return False
+    if any(
+        isinstance(item, (ast.Break, ast.Continue, ast.Return))
+        for item in ast.walk(node)
+    ):
+        return False
+    file_name = str(preprocessor.session_data.file_name)
+    return "nvidia_cutlass_dsl" not in file_name and "iket_cutedsl" not in file_name
+
+
+def _make_loop_transform(
+    original: Callable[..., Any], detailed_cta: DetailedCta
+) -> Callable[..., Any]:
+    @wraps(original)
+    def transform_for_loop(
+        preprocessor: DSLPreprocessor,
+        node: ast.For,
+        active_symbols: Any,
+        active_callables: Any,
+    ) -> Any:
+        if _should_instrument_loop(preprocessor, node):
+            source_line = node.lineno & ((1 << _LOOP_SITE_BITS) - 1)
+            token_name = (
+                f"__iket_auto_loop_token_{source_line}_"
+                f"{preprocessor.session_data.counter}"
+            )
+            helper_location = {
+                "lineno": node.lineno,
+                "col_offset": node.col_offset,
+            }
+            cta_node: ast.expr
+            if detailed_cta is None:
+                cta_node = ast.Constant(value=None)
+            else:
+                cta_node = ast.Tuple(
+                    elts=[ast.Constant(value=value) for value in detailed_cta],
+                    ctx=ast.Load(),
+                )
+            start = ast.Assign(
+                targets=[ast.Name(id=token_name, ctx=ast.Store())],
+                value=ast.Call(
+                    func=_create_module_attribute(
+                        _LOOP_START_HELPER, **helper_location
+                    ),
+                    args=[
+                        ast.Constant(value=source_line),
+                        ast.Name(id=node.target.id, ctx=ast.Load()),
+                        cta_node,
+                    ],
+                    keywords=[],
+                ),
+            )
+            end = ast.Expr(
+                value=ast.Call(
+                    func=_create_module_attribute(
+                        _LOOP_END_HELPER, **helper_location
+                    ),
+                    args=[
+                        ast.Name(id=token_name, ctx=ast.Load()),
+                        ast.Constant(value=source_line),
+                        ast.Name(id=node.target.id, ctx=ast.Load()),
+                    ],
+                    keywords=[],
+                )
+            )
+            node.body = [
+                ast.copy_location(ast.fix_missing_locations(start), node),
+                *node.body,
+                ast.copy_location(ast.fix_missing_locations(end), node),
+            ]
+        return original(preprocessor, node, active_symbols, active_callables)
+
+    return transform_for_loop
+
+
 def _install_patch(
-    saved_targets: List[Tuple[Any, str, Callable[..., Any]]],
+    saved_targets: List[Tuple[Any, str, Any]],
     owner: Any,
     name: str,
     event_selector: EventSelector,
@@ -480,6 +931,21 @@ def _install_patch(
     original = getattr(owner, name)
     saved_targets.append((owner, name, original))
     setattr(owner, name, _make_traced_call(original, event_selector, detailed_cta))
+
+
+def _set_patch(
+    saved_targets: List[Tuple[Any, str, Any]], owner: Any, name: str, value: Any
+) -> None:
+    saved_targets.append((owner, name, getattr(owner, name, _MISSING)))
+    setattr(owner, name, value)
+
+
+def _restore_targets(saved_targets: List[Tuple[Any, str, Any]]) -> None:
+    for owner, name, original in reversed(saved_targets):
+        if original is _MISSING:
+            delattr(owner, name)
+        else:
+            setattr(owner, name, original)
 
 
 def _install_timeline_patches(
@@ -501,26 +967,83 @@ def _install_timeline_patches(
     cute.gemm = _make_traced_gemm(original_gemm, detailed_cta)
     llvm.inline_asm = _make_traced_inline_asm(original_inline_asm, detailed_cta)
 
+    _set_patch(
+        _saved_targets,
+        ast_helpers,
+        _LOOP_START_HELPER,
+        _loop_range_start,
+    )
+    _set_patch(
+        _saved_targets,
+        ast_helpers,
+        _LOOP_END_HELPER,
+        _loop_range_end,
+    )
+    original_loop_transform = DSLPreprocessor.transform_for_loop
+    _set_patch(
+        _saved_targets,
+        DSLPreprocessor,
+        "transform_for_loop",
+        _make_loop_transform(original_loop_transform, detailed_cta),
+    )
+
+    for scheduler_type in (
+        utils.ClcDynamicPersistentTileScheduler,
+        utils.StaticPersistentTileScheduler,
+    ):
+        for method_name in ("get_current_work", "initial_work_tile_info"):
+            original = getattr(scheduler_type, method_name)
+            _set_patch(
+                _saved_targets,
+                scheduler_type,
+                method_name,
+                _make_traced_scheduler_work(original, detailed_cta),
+            )
+
+    # Grouped GEMM overrides get_current_work instead of inheriting the base
+    # implementation. Runtime schedulers inherit the already-patched static
+    # methods and therefore need no separate entry here.
+    _set_patch(
+        _saved_targets,
+        utils.StaticPersistentGroupTileScheduler,
+        "get_current_work",
+        _make_traced_scheduler_work(
+            utils.StaticPersistentGroupTileScheduler.get_current_work,
+            detailed_cta,
+        ),
+    )
+
+    # FlashAttention, Quack, and downstream projects commonly provide their
+    # own scheduler classes. Discover those classes when their modules finish
+    # importing and wrap the same protocol methods without repository-specific
+    # imports or source changes.
+    _set_patch(
+        _saved_targets,
+        builtins,
+        "__import__",
+        _make_scheduler_aware_import(builtins.__import__, detailed_cta),
+    )
+
     targets = (
         (
             pipeline.PipelineTmaAsync,
             "producer_acquire",
-            "auto.main.tma.buffer_wait",
+            _fixed_pipeline_event("auto.main.tma.buffer_wait"),
         ),
         (
             pipeline.PipelineTmaUmma,
             "producer_acquire",
-            "auto.main.tma.buffer_wait",
+            _fixed_pipeline_event("auto.main.tma.buffer_wait"),
         ),
         (
             pipeline.PipelineAsync,
             "producer_acquire",
-            "auto.pipeline.producer_wait",
+            _fixed_pipeline_event("auto.pipeline.producer_wait"),
         ),
         (
             pipeline.PipelineAsync,
             "consumer_wait",
-            "auto.pipeline.consumer_wait",
+            _fixed_pipeline_event("auto.pipeline.consumer_wait"),
         ),
         (
             pipeline.PipelineProducer,
@@ -542,7 +1065,11 @@ def _install_timeline_patches(
             "release",
             _consumer_release_event,
         ),
-        (pipeline.PipelineProducer, "tail", "auto.main.pipeline.tail"),
+        (
+            pipeline.PipelineProducer,
+            "tail",
+            _fixed_pipeline_event("auto.main.pipeline.tail"),
+        ),
         (
             pipeline.PipelineClcFetchAsync,
             "consumer_wait",
@@ -553,9 +1080,21 @@ def _install_timeline_patches(
             "advance_to_next_work",
             "auto.scheduler.issue",
         ),
-        (pipeline.PipelineTmaStore, "producer_commit", "auto.epilogue.store.commit"),
-        (pipeline.PipelineTmaStore, "producer_acquire", "auto.epilogue.store.wait"),
-        (pipeline.PipelineTmaStore, "producer_tail", "auto.epilogue.store.tail"),
+        (
+            pipeline.PipelineTmaStore,
+            "producer_commit",
+            _fixed_pipeline_event("auto.epilogue.store.commit"),
+        ),
+        (
+            pipeline.PipelineTmaStore,
+            "producer_acquire",
+            _fixed_pipeline_event("auto.epilogue.store.wait"),
+        ),
+        (
+            pipeline.PipelineTmaStore,
+            "producer_tail",
+            _fixed_pipeline_event("auto.epilogue.store.tail"),
+        ),
         (utils.TmemAllocator, "allocate", "auto.epilogue.tmem.alloc"),
         (utils.TmemAllocator, "wait_for_alloc", "auto.setup.tmem.alloc_wait"),
         (
@@ -608,11 +1147,11 @@ def patch_cute_iket_ops(
         if _patch_depth == 0:
             _saved_targets = []
             _active_detailed_cta = normalized_cta
+            _trace_state.suppress_scheduler_hook = False
             try:
                 _install_timeline_patches(kernel_module, normalized_cta)
             except Exception:
-                for owner, name, original in reversed(_saved_targets):
-                    setattr(owner, name, original)
+                _restore_targets(_saved_targets)
                 _saved_targets = None
                 _active_detailed_cta = None
                 raise
@@ -631,8 +1170,7 @@ def patch_cute_iket_ops(
             _patch_depth -= 1
             if _patch_depth == 0:
                 assert _saved_targets is not None
-                for owner, name, original in reversed(_saved_targets):
-                    setattr(owner, name, original)
+                _restore_targets(_saved_targets)
                 _saved_targets = None
                 _active_detailed_cta = None
     finally:

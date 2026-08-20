@@ -1,12 +1,16 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import ast
+import inspect
 from pathlib import Path
 import sys
+from types import ModuleType
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass._mlir.dialects import llvm
@@ -27,6 +31,13 @@ sys.path.insert(0, str(PACKAGE_SRC))
 
 
 from iket_cutedsl import auto_ops  # noqa: E402
+
+
+@cute.jit
+def _dynamic_loop_fixture(stop: cutlass.Int32):
+    for tile in cutlass.range(stop):
+        stop = tile
+    return stop
 
 
 class IketAutoOpsTest(unittest.TestCase):
@@ -144,7 +155,7 @@ class IketAutoOpsTest(unittest.TestCase):
         token = object()
 
         with mock.patch.object(auto_ops, "_range_start", return_value=token) as start:
-            with mock.patch.object(cute.experimental.iket, "range_end") as end:
+            with mock.patch.object(auto_ops, "_range_end") as end:
                 result = traced(
                     None,
                     ["operand"],
@@ -169,6 +180,10 @@ class IketAutoOpsTest(unittest.TestCase):
         original_legacy_wait = pipeline.PipelineAsync.consumer_wait
         original_cpasync_wait = cute.arch.cp_async_wait_group
         original_inline_asm = llvm.inline_asm
+        original_loop_transform = auto_ops.DSLPreprocessor.transform_for_loop
+        original_scheduler_work = (
+            auto_ops.utils.ClcDynamicPersistentTileScheduler.get_current_work
+        )
 
         with auto_ops.patch_cute_iket_ops():
             patched_copy = cute.copy
@@ -177,12 +192,22 @@ class IketAutoOpsTest(unittest.TestCase):
             patched_legacy_wait = pipeline.PipelineAsync.consumer_wait
             patched_cpasync_wait = cute.arch.cp_async_wait_group
             patched_inline_asm = llvm.inline_asm
+            patched_loop_transform = auto_ops.DSLPreprocessor.transform_for_loop
+            patched_scheduler_work = (
+                auto_ops.utils.ClcDynamicPersistentTileScheduler.get_current_work
+            )
             self.assertIsNot(patched_copy, original_copy)
             self.assertIsNot(patched_gemm, original_gemm)
             self.assertIsNot(patched_wait, original_wait)
             self.assertIsNot(patched_legacy_wait, original_legacy_wait)
             self.assertIsNot(patched_cpasync_wait, original_cpasync_wait)
             self.assertIsNot(patched_inline_asm, original_inline_asm)
+            self.assertIsNot(patched_loop_transform, original_loop_transform)
+            self.assertIsNot(patched_scheduler_work, original_scheduler_work)
+            self.assertIs(
+                getattr(auto_ops.ast_helpers, auto_ops._LOOP_START_HELPER),
+                auto_ops._loop_range_start,
+            )
             with auto_ops.patch_cute_iket_ops():
                 self.assertIs(cute.copy, patched_copy)
                 self.assertIs(cute.gemm, patched_gemm)
@@ -192,6 +217,10 @@ class IketAutoOpsTest(unittest.TestCase):
                 )
                 self.assertIs(cute.arch.cp_async_wait_group, patched_cpasync_wait)
                 self.assertIs(llvm.inline_asm, patched_inline_asm)
+                self.assertIs(
+                    auto_ops.DSLPreprocessor.transform_for_loop,
+                    patched_loop_transform,
+                )
 
         self.assertIs(cute.copy, original_copy)
         self.assertIs(cute.gemm, original_gemm)
@@ -199,6 +228,16 @@ class IketAutoOpsTest(unittest.TestCase):
         self.assertIs(pipeline.PipelineAsync.consumer_wait, original_legacy_wait)
         self.assertIs(cute.arch.cp_async_wait_group, original_cpasync_wait)
         self.assertIs(llvm.inline_asm, original_inline_asm)
+        self.assertIs(
+            auto_ops.DSLPreprocessor.transform_for_loop, original_loop_transform
+        )
+        self.assertIs(
+            auto_ops.utils.ClcDynamicPersistentTileScheduler.get_current_work,
+            original_scheduler_work,
+        )
+        self.assertFalse(
+            hasattr(auto_ops.ast_helpers, auto_ops._LOOP_START_HELPER)
+        )
 
     def test_detailed_cta_is_validated_and_inherited_by_nested_patch(self):
         with self.assertRaisesRegex(TypeError, "three-integer tuple"):
@@ -230,6 +269,121 @@ class IketAutoOpsTest(unittest.TestCase):
         self.assertIs(cute.copy, original_copy)
         self.assertIs(cute.gemm, original_gemm)
         self.assertIs(pipeline.PipelineConsumer.wait_and_advance, original_wait)
+
+    def test_loop_transform_wraps_each_dynamic_iteration(self):
+        node = ast.parse("for tile in cutlass.range(2, 7):\n    consume(tile)\n").body[0]
+        self.assertIsInstance(node, ast.For)
+        preprocessor = SimpleNamespace(
+            session_data=SimpleNamespace(file_name="/tmp/kernel.py", counter=13)
+        )
+        original = mock.Mock(return_value=[node])
+
+        transformed = auto_ops._make_loop_transform(original, (2, 1, 0))(
+            preprocessor, node, [set()], [set()]
+        )
+
+        self.assertEqual(transformed, [node])
+        self.assertEqual(len(node.body), 3)
+        start, _, end = node.body
+        self.assertIsInstance(start, ast.Assign)
+        self.assertIsInstance(end, ast.Expr)
+        self.assertEqual(start.value.func.attr, auto_ops._LOOP_START_HELPER)
+        self.assertEqual(end.value.func.attr, auto_ops._LOOP_END_HELPER)
+        self.assertEqual(ast.literal_eval(start.value.args[2]), (2, 1, 0))
+        self.assertEqual(len(start.value.args), 3)
+        self.assertEqual(len(end.value.args), 3)
+        self.assertEqual(start.targets[0].id, end.value.args[0].id)
+        self.assertEqual(start.value.args[1].id, "tile")
+        self.assertEqual(end.value.args[2].id, "tile")
+
+    def test_real_preprocessor_accepts_injected_loop_helpers(self):
+        preprocessor = auto_ops.DSLPreprocessor(["cutlass"])
+        with auto_ops.patch_cute_iket_ops(detailed_cta=(0, 0, 0)):
+            with preprocessor.get_session():
+                tree = preprocessor.transform(
+                    inspect.unwrap(_dynamic_loop_fixture), globals()
+                )
+
+        transformed = ast.unparse(tree)
+        self.assertIn(auto_ops._LOOP_START_HELPER, transformed)
+        self.assertIn(auto_ops._LOOP_END_HELPER, transformed)
+
+    def test_loop_transform_skips_unbalanced_control_flow(self):
+        node = ast.parse(
+            "for tile in cutlass.range(8):\n"
+            "    if tile == 3:\n"
+            "        continue\n"
+            "    consume(tile)\n"
+        ).body[0]
+        self.assertIsInstance(node, ast.For)
+        preprocessor = SimpleNamespace(
+            session_data=SimpleNamespace(file_name="/tmp/kernel.py", counter=7)
+        )
+        original = mock.Mock(return_value=[node])
+
+        auto_ops._make_loop_transform(original, None)(
+            preprocessor, node, [set()], [set()]
+        )
+
+        self.assertEqual(len(node.body), 2)
+
+    def test_discovers_and_restores_third_party_scheduler(self):
+        module = ModuleType("downstream.tile_scheduler")
+
+        def get_current_work(self, *, loc=None, ip=None):
+            return self.work
+
+        scheduler = type(
+            "DownstreamTileScheduler",
+            (),
+            {
+                "__module__": module.__name__,
+                "get_current_work": get_current_work,
+            },
+        )
+        module.DownstreamTileScheduler = scheduler
+        original = scheduler.get_current_work
+
+        with auto_ops.patch_cute_iket_ops(detailed_cta=(0, 0, 0)):
+            auto_ops._patch_scheduler_classes_in_module(module, (0, 0, 0))
+            self.assertIsNot(scheduler.get_current_work, original)
+
+        self.assertIs(scheduler.get_current_work, original)
+
+    def test_import_hook_rescans_completed_requested_module(self):
+        module_name = "downstream.completed_scheduler"
+        module = ModuleType(module_name)
+
+        def get_current_work(self, *, loc=None, ip=None):
+            return self.work
+
+        scheduler = type(
+            "CompletedTileScheduler",
+            (),
+            {"__module__": module_name, "get_current_work": get_current_work},
+        )
+        module.CompletedTileScheduler = scheduler
+        original = scheduler.get_current_work
+
+        def fake_import(name, *args, **kwargs):
+            sys.modules[name] = module
+            return ModuleType("downstream")
+
+        try:
+            with auto_ops.patch_cute_iket_ops(detailed_cta=(0, 0, 0)):
+                traced_import = auto_ops._make_scheduler_aware_import(
+                    fake_import, (0, 0, 0)
+                )
+                traced_import(module_name)
+                self.assertIsNot(scheduler.get_current_work, original)
+        finally:
+            sys.modules.pop(module_name, None)
+
+        self.assertIs(scheduler.get_current_work, original)
+
+    def test_flattens_four_axis_and_nested_scheduler_coordinates(self):
+        work = SimpleNamespace(tile_idx=(4, None, (7, 9)))
+        self.assertEqual(auto_ops._tile_coord_components(work), (4, 0, 7, 9))
 
 
 if __name__ == "__main__":

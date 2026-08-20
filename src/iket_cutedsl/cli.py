@@ -6,12 +6,14 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import shlex
 import subprocess
 import sys
 from typing import Sequence
 
 from .bootstrap import parse_detailed_cta
+from .semantics import write_semantic_sidecars, write_semantic_trace
 
 
 def _target(command: Sequence[str]) -> list[str]:
@@ -126,6 +128,12 @@ def get_parser() -> argparse.ArgumentParser:
         "run", help="instrument and run a target without launching run-iket"
     )
     _add_target_arguments(run)
+
+    decode = subparsers.add_parser(
+        "decode", help="decode tile/stage/loop payloads in an IKET JSON trace"
+    )
+    decode.add_argument("trace", type=Path)
+    decode.add_argument("--output", "-o", type=Path)
     return parser
 
 
@@ -138,7 +146,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.print_command:
                 print(shlex.join(command))
                 return 0
-            return subprocess.run(command, check=False).returncode
+            result = subprocess.run(command, check=False)
+            if result.returncode == 0 and args.postprocess in ("json", "all"):
+                for path in write_semantic_sidecars(Path(args.output_dir)):
+                    print(f"[iket-cutedsl] Wrote semantic trace to {path}")
+            return result.returncode
+
+        if args.subcommand == "decode":
+            output = write_semantic_trace(args.trace, args.output)
+            print(output)
+            return 0
 
         from .bootstrap import main as bootstrap_main
 
