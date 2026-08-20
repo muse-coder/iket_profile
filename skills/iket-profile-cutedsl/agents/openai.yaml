@@ -1,0 +1,4 @@
+interface:
+  display_name: "IKET CuTeDSL Profiler"
+  short_description: "Profile CuTeDSL warp timelines with IKET"
+  default_prompt: "Use $iket-profile-cutedsl to profile a CuTe DSL kernel and explain the resulting warp timeline."
