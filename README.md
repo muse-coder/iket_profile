@@ -194,6 +194,10 @@ Use $iket-profile-cutedsl to profile this CuTe DSL kernel and explain which
 warps are waiting.
 ```
 
+仓库同时包含 NCU PM Sampling 与 IKET timeline 的联合分析工具和 skill。安装后
+可使用 `ncu-iket-collect`、`ncu-iket-merge`、`ncu-iket-validate`，完整流程见
+[`docs/ncu_iket_joint_profile.md`](docs/ncu_iket_joint_profile.md)。
+
 ## License
 
 本仓库代码使用 BSD-3-Clause。CuTe DSL 和 IKET runtime 使用各自的 NVIDIA

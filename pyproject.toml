@@ -16,6 +16,10 @@ dev = ["ruff>=0.12,<1"]
 
 [project.scripts]
 iket-cutedsl = "iket_cutedsl.cli:entrypoint"
+ncu-iket-collect = "ncu_iket_profile.collect_ncu:entrypoint"
+ncu-iket-merge = "ncu_iket_profile.merge:entrypoint"
+ncu-iket-preflight = "ncu_iket_profile.preflight:entrypoint"
+ncu-iket-validate = "ncu_iket_profile.validate:entrypoint"
 
 [tool.setuptools.packages.find]
 where = ["src"]

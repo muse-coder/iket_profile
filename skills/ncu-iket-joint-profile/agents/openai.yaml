@@ -1,0 +1,4 @@
+interface:
+  display_name: "NCU + IKET Timeline Analyst"
+  short_description: "Run NCU sampling and correlate IKET timelines"
+  default_prompt: "Use $ncu-iket-joint-profile to run NCU PM Sampling and correlate it with this IKET fine-grained timeline."
